@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- rollouts_v1alpha1_batchrelease.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,0 +1,28 @@
+apiVersion: rollouts.yuyy.com/v1alpha1
+kind: BatchRelease
+metadata:
+  name: yuyy-nginx
+  labels:
+    app: yuyy-nginx
+spec:
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: yuyy-nginx
+  strategy:
+    steps:
+      - replicas: 1
+      - replicas: 10%
+      - replicas: 30%
+      - replicas: 60%
+      - replicas: 100%
+  template:
+    metadata:
+      labels:
+        app: yuyy-nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.14.2
+          ports:
+            - containerPort: 80
