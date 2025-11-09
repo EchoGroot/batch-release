@@ -3,6 +3,12 @@ package partition
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/EchoGroot/batch-release/api/v1alpha1"
 	deploymentutil "github.com/EchoGroot/batch-release/pkg/util/deployment"
 	jsonutil "github.com/EchoGroot/batch-release/pkg/util/json"
@@ -18,12 +24,8 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/integer"
-	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sort"
-	"strconv"
-	"time"
 )
 
 const (
@@ -71,6 +73,7 @@ func (r *Executor) finalize(ctx context.Context) (ctrl.Result, error) {
 		newDe := object.(*apps.Deployment)
 		newDe.Spec.Paused = false
 		newDe.Spec.Strategy.Type = apps.RollingUpdateDeploymentStrategyType
+		newDe.Spec.Strategy.RollingUpdate = &apps.RollingUpdateDeployment{MaxSurge: r.Br.Status.MaxSurge, MaxUnavailable: r.Br.Status.MaxUnavailable}
 		delete(newDe.Annotations, v1alpha1.BatchReleaseControlInfoAnno)
 	})
 	if err != nil {
@@ -86,16 +89,26 @@ func (r *Executor) init(ctx context.Context) (ctrl.Result, error) {
 	r.Br.Status.CurrentStepIndex = 0
 	r.Br.Status.CurrentStepState = ""
 	r.Br.Status.UpdatedReadyReplicas = 0
+	if r.de.Spec.Strategy.RollingUpdate == nil {
+		return ctrl.Result{}, fmt.Errorf("deployment %s/%s does not have RollingUpdate strategy", r.de.Namespace, r.de.Name)
+	}
+	r.Br.Status.MaxUnavailable = r.de.Spec.Strategy.RollingUpdate.MaxUnavailable
+	r.Br.Status.MaxSurge = r.de.Spec.Strategy.RollingUpdate.MaxSurge
 
 	if err := UpdateObj(ctx, r.client, r.de, func(object client.Object) {
 		d := object.(*apps.Deployment)
 		d.Spec.Template = r.Br.Spec.Template
 		d.Spec.Paused = true
 		d.Spec.Strategy.Type = apps.RecreateDeploymentStrategyType
+		d.Spec.Strategy.RollingUpdate = nil
+		if d.Annotations == nil {
+			d.Annotations = make(map[string]string)
+		}
 		d.Annotations[v1alpha1.BatchReleaseControlInfoAnno] = jsonutil.DumpJSON(metav1.NewControllerRef(r.Br, r.Br.GetObjectKind().GroupVersionKind()))
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
+	klog.V(1).Infof("Successfully updated Deployment %s", r.de.Name)
 
 	r.Br.Status.Phase = v1alpha1.PhaseRollingUpdate
 	return ctrl.Result{}, nil
@@ -181,7 +194,7 @@ func (bc *Executor) IsBatchReady() error {
 		return fmt.Errorf("current batch not ready: updated replicas not satisfied, UpdatedReplicas %d < DesiredUpdatedReplicas %d", bc.de.Status.UpdatedReplicas, DesiredUpdatedReplicas)
 	}
 
-	unavailableToleration := allowedUnavailable(bc.de.Spec.Strategy.RollingUpdate.MaxUnavailable, bc.de.Status.UpdatedReplicas)
+	unavailableToleration := allowedUnavailable(bc.Br.Status.MaxUnavailable, bc.de.Status.UpdatedReplicas)
 	if unavailableToleration+bc.Br.Status.UpdatedReadyReplicas < DesiredUpdatedReplicas {
 		return fmt.Errorf("current batch not ready: updated ready replicas not satisfied, allowedUnavailable + UpdatedReadyReplicas %d < DesiredUpdatedReplicas %d", unavailableToleration+bc.Br.Status.UpdatedReadyReplicas, DesiredUpdatedReplicas)
 	}
@@ -209,7 +222,7 @@ func (dc *Executor) reconcileOldReplicaSets(ctx context.Context, allRSs []*apps.
 
 	allPodsCount := deploymentutil.GetReplicaCountForReplicaSets(allRSs)
 	klog.V(4).Infof("New replica set %s/%s has %d available pods.", newRS.Namespace, newRS.Name, newRS.Status.AvailableReplicas)
-	maxUnavailable := deploymentutil.MaxUnavailable(deployment)
+	maxUnavailable := dc.maxUnavailable()
 
 	// Old RSes should obey the limitation of partition.
 	ScaleDownOldLimit := ScaleDownLimitForOld(oldRSs, newRS, deployment, dc.Br.Spec.Strategy.Steps[dc.Br.Status.CurrentStepIndex].Replicas)
@@ -277,6 +290,18 @@ func (dc *Executor) reconcileOldReplicaSets(ctx context.Context, allRSs []*apps.
 	return totalScaledDown > 0, nil
 }
 
+func (dc *Executor) maxUnavailable() int32 {
+	if *(dc.de.Spec.Replicas) == 0 {
+		return int32(0)
+	}
+	// Error caught by validation
+	_, maxUnavailable, _ := deploymentutil.ResolveFenceposts(dc.Br.Status.MaxSurge, dc.Br.Status.MaxUnavailable, *(dc.de.Spec.Replicas))
+	if maxUnavailable > *dc.de.Spec.Replicas {
+		return *dc.de.Spec.Replicas
+	}
+	return maxUnavailable
+}
+
 func (dc *Executor) scaleUpOldReplicaSets(ctx context.Context, oldRSs []*apps.ReplicaSet, scaledUpCount int32, deployment *apps.Deployment) (bool, error) {
 	if scaledUpCount <= 0 || len(oldRSs) == 0 {
 		return false, nil
@@ -289,7 +314,7 @@ func (dc *Executor) scaleUpOldReplicaSets(ctx context.Context, oldRSs []*apps.Re
 }
 
 func (dc *Executor) scaleDownOldReplicaSetsForRollingUpdate(ctx context.Context, allRSs []*apps.ReplicaSet, oldRSs []*apps.ReplicaSet, deployment *apps.Deployment) (int32, error) {
-	maxUnavailable := deploymentutil.MaxUnavailable(deployment)
+	maxUnavailable := dc.maxUnavailable()
 
 	// Check if we can scale down.
 	minAvailable := *(deployment.Spec.Replicas) - maxUnavailable
@@ -395,7 +420,7 @@ func ScaleDownLimitForOld(oldRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, dep
 }
 
 func (dc *Executor) syncRolloutStatus(ctx context.Context, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet) error {
-	newStatus := calculateStatus(allRSs, newRS, dc.de)
+	newStatus := dc.calculateStatus(allRSs, newRS)
 
 	// If there is no progressDeadlineSeconds set, remove any Progressing condition.
 	if !deploymentutil.HasProgressDeadline(dc.de) {
@@ -598,7 +623,7 @@ func (dc *Executor) getReplicaFailures(allRSs []*apps.ReplicaSet, newRS *apps.Re
 	return conditions
 }
 
-func calculateStatus(allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployment *apps.Deployment) apps.DeploymentStatus {
+func (dc *Executor) calculateStatus(allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet) apps.DeploymentStatus {
 	availableReplicas := deploymentutil.GetAvailableReplicaCountForReplicaSets(allRSs)
 	totalReplicas := deploymentutil.GetReplicaCountForReplicaSets(allRSs)
 	unavailableReplicas := totalReplicas - availableReplicas
@@ -610,22 +635,22 @@ func calculateStatus(allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, deployme
 
 	status := apps.DeploymentStatus{
 		// TODO: Ensure that if we start retrying status updates, we won't pick up a new Generation value.
-		ObservedGeneration:  deployment.Generation,
+		ObservedGeneration:  dc.de.Generation,
 		Replicas:            deploymentutil.GetActualReplicaCountForReplicaSets(allRSs),
 		UpdatedReplicas:     deploymentutil.GetActualReplicaCountForReplicaSets([]*apps.ReplicaSet{newRS}),
 		ReadyReplicas:       deploymentutil.GetReadyReplicaCountForReplicaSets(allRSs),
 		AvailableReplicas:   availableReplicas,
 		UnavailableReplicas: unavailableReplicas,
-		CollisionCount:      deployment.Status.CollisionCount,
+		CollisionCount:      dc.de.Status.CollisionCount,
 	}
 
 	// Copy conditions one by one so we won't mutate the original object.
-	conditions := deployment.Status.Conditions
+	conditions := dc.de.Status.Conditions
 	for i := range conditions {
 		status.Conditions = append(status.Conditions, conditions[i])
 	}
 
-	if availableReplicas >= *(deployment.Spec.Replicas)-deploymentutil.MaxUnavailable(deployment) {
+	if availableReplicas >= *(dc.de.Spec.Replicas)-dc.maxUnavailable() {
 		minAvailability := deploymentutil.NewDeploymentCondition(apps.DeploymentAvailable, v1.ConditionTrue, deploymentutil.MinimumReplicasAvailable, "Deployment has minimum availability.")
 		deploymentutil.SetDeploymentCondition(&status, *minAvailability)
 	} else {
@@ -646,7 +671,7 @@ func (dc *Executor) reconcileNewReplicaSet(ctx context.Context, allRSs []*apps.R
 		scaled, _, err := dc.scaleReplicaSetAndRecordEvent(ctx, newRS, *(dc.de.Spec.Replicas), dc.de)
 		return scaled, err
 	}
-	newReplicasCount, err := deploymentutil.NewRSNewReplicas(dc.de, allRSs, newRS, dc.Br.Spec.Strategy.Steps[dc.Br.Status.CurrentStepIndex])
+	newReplicasCount, err := dc.newRSNewReplicas(dc.de, allRSs, newRS, dc.Br.Spec.Strategy.Steps[dc.Br.Status.CurrentStepIndex])
 	if err != nil {
 		return false, err
 	}
@@ -672,7 +697,7 @@ func (dc *Executor) scaleReplicaSet(ctx context.Context, rs *apps.ReplicaSet, ne
 
 	sizeNeedsUpdate := *(rs.Spec.Replicas) != newScale
 
-	annotationsNeedUpdate := deploymentutil.ReplicasAnnotationsNeedUpdate(rs, *(deployment.Spec.Replicas), *(deployment.Spec.Replicas)+deploymentutil.MaxSurge(deployment))
+	annotationsNeedUpdate := deploymentutil.ReplicasAnnotationsNeedUpdate(rs, *(deployment.Spec.Replicas), *(deployment.Spec.Replicas)+dc.maxSurge())
 
 	scaled := false
 	var err error
@@ -682,7 +707,7 @@ func (dc *Executor) scaleReplicaSet(ctx context.Context, rs *apps.ReplicaSet, ne
 		// Use existing state directly for patching, let API Server handle conflicts
 		rsCopy := rs.DeepCopy()
 		*(rsCopy.Spec.Replicas) = newScale
-		deploymentutil.SetReplicasAnnotations(rsCopy, *(deployment.Spec.Replicas), *(deployment.Spec.Replicas)+deploymentutil.MaxSurge(deployment))
+		deploymentutil.SetReplicasAnnotations(rsCopy, *(deployment.Spec.Replicas), *(deployment.Spec.Replicas)+dc.maxSurge())
 
 		// Use MergeFrom with optimistic lock for patching, if ResourceVersion conflicts, API Server will return 409 error
 		// Controller-runtime will automatically reschedule for reconciliation
@@ -729,7 +754,7 @@ func (r *Executor) getNewReplicaSet(ctx context.Context, rsList, oldRSs []*apps.
 		rsCopy := existingNewRS.DeepCopy()
 
 		// Set existing new replica set's annotation
-		annotationsUpdated := deploymentutil.SetNewReplicaSetAnnotations(r.de, rsCopy, newRevision, true, maxRevHistoryLengthInChars)
+		annotationsUpdated := r.setNewReplicaSetAnnotations(rsCopy, newRevision, true, maxRevHistoryLengthInChars)
 		minReadySecondsNeedsUpdate := rsCopy.Spec.MinReadySeconds != r.de.Spec.MinReadySeconds
 		if annotationsUpdated || minReadySecondsNeedsUpdate {
 			// Update the copy with the new minReadySeconds
@@ -798,7 +823,7 @@ func (r *Executor) getNewReplicaSet(ctx context.Context, rsList, oldRSs []*apps.
 		},
 	}
 	allRSs := append(oldRSs, &newRS)
-	newReplicasCount, err := deploymentutil.NewRSNewReplicas(r.de, allRSs, &newRS, r.Br.Spec.Strategy.Steps[r.Br.Status.CurrentStepIndex])
+	newReplicasCount, err := r.newRSNewReplicas(r.de, allRSs, &newRS, r.Br.Spec.Strategy.Steps[r.Br.Status.CurrentStepIndex])
 	if err != nil {
 		return nil, err
 	}
@@ -806,11 +831,11 @@ func (r *Executor) getNewReplicaSet(ctx context.Context, rsList, oldRSs []*apps.
 	// We ensure that newReplicasLowerBound is greater than 0 unless deployment is 0,
 	// this is because if we set new replicas as 0, the native deployment controller
 	// will flight with ours.
-	newReplicasLowerBound := deploymentutil.NewRSReplicasLowerBound(r.de)
+	newReplicasLowerBound := r.newRSReplicasLowerBound(r.de)
 
 	*(newRS.Spec.Replicas) = integer.Int32Max(newReplicasCount, newReplicasLowerBound)
 	// Set new replica set's annotation
-	deploymentutil.SetNewReplicaSetAnnotations(r.de, &newRS, newRevision, false, maxRevHistoryLengthInChars)
+	r.setNewReplicaSetAnnotations(&newRS, newRevision, false, maxRevHistoryLengthInChars)
 	// Create the new ReplicaSet. If it already exists, then we need to check for possible
 	// hash collisions. If there is any other error, we need to report it in the status of
 	// the Deployment.
@@ -942,4 +967,107 @@ func UpdateObjStatus(ctx context.Context, cli client.Client, obj client.Object, 
 		patch(obj)
 		return cli.Status().Update(ctx, obj)
 	})
+}
+
+func (dc *Executor) maxSurge() int32 {
+	maxSurge, _, _ := deploymentutil.ResolveFenceposts(dc.Br.Status.MaxSurge, dc.Br.Status.MaxUnavailable, *(dc.de.Spec.Replicas))
+	return maxSurge
+}
+
+func (dc *Executor) setNewReplicaSetAnnotations(newRS *apps.ReplicaSet, newRevision string, exists bool, revHistoryLimitInChars int) bool {
+	// First, copy deployment's annotations (except for apply and revision annotations)
+	annotationChanged := deploymentutil.CopyDeploymentAnnotationsToReplicaSet(dc.de, newRS)
+	// Then, update replica set's revision annotation
+	if newRS.Annotations == nil {
+		newRS.Annotations = make(map[string]string)
+	}
+	oldRevision, ok := newRS.Annotations[deploymentutil.RevisionAnnotation]
+	// The newRS's revision should be the greatest among all RSes. Usually, its revision number is newRevision (the max revision number
+	// of all old RSes + 1). However, it's possible that some of the old RSes are deleted after the newRS revision being updated, and
+	// newRevision becomes smaller than newRS's revision. We should only update newRS revision when it's smaller than newRevision.
+
+	oldRevisionInt, err := strconv.ParseInt(oldRevision, 10, 64)
+	if err != nil {
+		if oldRevision != "" {
+			klog.Warningf("Updating replica set revision OldRevision not int %s", err)
+			return false
+		}
+		// If the RS annotation is empty then initialize it to 0
+		oldRevisionInt = 0
+	}
+	newRevisionInt, err := strconv.ParseInt(newRevision, 10, 64)
+	if err != nil {
+		klog.Warningf("Updating replica set revision NewRevision not int %s", err)
+		return false
+	}
+	if oldRevisionInt < newRevisionInt {
+		newRS.Annotations[deploymentutil.RevisionAnnotation] = newRevision
+		annotationChanged = true
+		klog.V(4).Infof("Updating replica set %q revision to %s", newRS.Name, newRevision)
+	}
+	// If a revision annotation already existed and this replica set was updated with a new revision
+	// then that means we are rolling back to this replica set. We need to preserve the old revisions
+	// for historical information.
+	if ok && oldRevisionInt < newRevisionInt {
+		revisionHistoryAnnotation := newRS.Annotations[deploymentutil.RevisionHistoryAnnotation]
+		oldRevisions := strings.Split(revisionHistoryAnnotation, ",")
+		if len(oldRevisions[0]) == 0 {
+			newRS.Annotations[deploymentutil.RevisionHistoryAnnotation] = oldRevision
+		} else {
+			totalLen := len(revisionHistoryAnnotation) + len(oldRevision) + 1
+			// index for the starting position in oldRevisions
+			start := 0
+			for totalLen > revHistoryLimitInChars && start < len(oldRevisions) {
+				totalLen = totalLen - len(oldRevisions[start]) - 1
+				start++
+			}
+			if totalLen <= revHistoryLimitInChars {
+				oldRevisions = append(oldRevisions[start:], oldRevision)
+				newRS.Annotations[deploymentutil.RevisionHistoryAnnotation] = strings.Join(oldRevisions, ",")
+			} else {
+				klog.Warningf("Not appending revision due to length limit of %v reached", revHistoryLimitInChars)
+			}
+		}
+	}
+	// If the new replica set is about to be created, we need to add replica annotations to it.
+	if !exists && deploymentutil.SetReplicasAnnotations(newRS, *(dc.de.Spec.Replicas), *(dc.de.Spec.Replicas)+dc.maxSurge()) {
+		annotationChanged = true
+	}
+	return annotationChanged
+}
+
+func (dc *Executor) newRSNewReplicas(deployment *apps.Deployment, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, currentStep v1alpha1.Step) (int32, error) {
+	// Find the total number of pods
+	currentPodCount := deploymentutil.GetReplicaCountForReplicaSets(allRSs)
+	switch {
+	case currentPodCount > *newRS.Spec.Replicas:
+		// Do not scale down due to partition settings.
+		scaleUpLimit := deploymentutil.NewRSReplicasLimit(currentStep.Replicas, deployment)
+		if *newRS.Spec.Replicas >= scaleUpLimit {
+			// Cannot scale up.
+			return *(newRS.Spec.Replicas), nil
+		}
+		// Do not scale up due to exceeded current replicas.
+		maxTotalPods := *(deployment.Spec.Replicas) + dc.maxSurge()
+		if currentPodCount >= maxTotalPods {
+			// Cannot scale up.
+			return *(newRS.Spec.Replicas), nil
+		}
+		// Scale up.
+		scaleUpCount := maxTotalPods - currentPodCount
+		// Do not exceed the number of desired replicas.
+		scaleUpCount = int32(integer.IntMin(int(scaleUpCount), int(*(deployment.Spec.Replicas)-*(newRS.Spec.Replicas))))
+		// Do not exceed the number of partition replicas.
+		return integer.Int32Min(*(newRS.Spec.Replicas)+scaleUpCount, scaleUpLimit), nil
+	default:
+		// If there is ONLY ONE active replica set, just be in line with deployment replicas.
+		return *(deployment.Spec.Replicas), nil
+	}
+}
+
+func (dc *Executor) newRSReplicasLowerBound(deployment *apps.Deployment) int32 {
+	if dc.maxSurge() > 0 {
+		return int32(0)
+	}
+	return integer.Int32Min(int32(1), *deployment.Spec.Replicas)
 }

@@ -18,6 +18,9 @@ package controller
 
 import (
 	"context"
+	"reflect"
+	"time"
+
 	v1alpha1 "github.com/EchoGroot/batch-release/api/v1alpha1"
 	"github.com/EchoGroot/batch-release/internal/controller/partition"
 	deploymentutil "github.com/EchoGroot/batch-release/pkg/util/deployment"
@@ -29,11 +32,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
-	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"time"
 )
 
 const DefaultRetryDuration = 2 * time.Second
@@ -59,9 +60,11 @@ type BatchReleaseReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	klog.V(2).Infof("[Reconcile] Start reconciling BatchRelease %s", req.NamespacedName)
 	var br = &v1alpha1.BatchRelease{}
 	if err := r.Get(ctx, req.NamespacedName, br); err != nil {
 		if errors.IsNotFound(err) {
+			klog.V(2).Infof("[Reconcile] BatchRelease %s not found, skip", req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -85,7 +88,7 @@ func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	if !reflect.DeepEqual(br.Status, executor.Br.Status) {
 		klog.V(1).Infof("BatchRelease %v status changed, old:%v, new:%v", br.Name, br.Status, executor.Br.Status)
-		if err := partition.UpdateObjStatus(ctx, r.Client, executor.Br, func(object client.Object) {
+		if err := partition.UpdateObjStatus(ctx, r.Client, br.DeepCopy(), func(object client.Object) {
 			newBr := object.(*v1alpha1.BatchRelease)
 			newBr.Status = executor.Br.Status
 			newBr.Status.ObservedGeneration = br.Generation

@@ -83,14 +83,16 @@ type BatchReleaseStatus struct {
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
-	Phase                Phase              `json:"phase,omitempty"`
-	CurrentStepIndex     int32              `json:"currentStepIndex,omitempty"`
-	CurrentStepState     StepState          `json:"currentStepState,omitempty"`
-	UpdatedReadyReplicas int32              `json:"updatedReadyReplicas,omitempty"`
-	Reason               BatchReleaseReason `json:"reason,omitempty"`
-	Message              string             `json:"message,omitempty"`
-	ObservedGeneration   int64              `json:"observedGeneration,omitempty"`
-	LastUpdateTime       *metav1.Time       `json:"lastUpdateTime,omitempty"`
+	Phase                Phase               `json:"phase,omitempty"`
+	CurrentStepIndex     int32               `json:"currentStepIndex,omitempty"`
+	CurrentStepState     StepState           `json:"currentStepState,omitempty"`
+	UpdatedReadyReplicas int32               `json:"updatedReadyReplicas,omitempty"`
+	MaxUnavailable       *intstr.IntOrString `json:"maxUnavailable,omitempty" protobuf:"bytes,1,opt,name=maxUnavailable"`
+	MaxSurge             *intstr.IntOrString `json:"maxSurge,omitempty" protobuf:"bytes,2,opt,name=maxSurge"`
+	Reason               BatchReleaseReason  `json:"reason,omitempty"`
+	Message              string              `json:"message,omitempty"`
+	ObservedGeneration   int64               `json:"observedGeneration,omitempty"`
+	LastUpdateTime       *metav1.Time        `json:"lastUpdateTime,omitempty"`
 }
 
 type BatchReleaseReason string

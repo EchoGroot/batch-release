@@ -3,10 +3,14 @@ package deploymentutil
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/EchoGroot/batch-release/api/v1alpha1"
-	"github.com/davecgh/go-spew/spew"
 	"hash"
 	"hash/fnv"
+	"math"
+	"sort"
+	"strconv"
+	"time"
+
+	"github.com/davecgh/go-spew/spew"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -16,11 +20,6 @@ import (
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/integer"
-	"math"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
 )
 
 const (
@@ -121,77 +120,6 @@ func Revision(obj runtime.Object) (int64, error) {
 	return strconv.ParseInt(v, 10, 64)
 }
 
-func SetNewReplicaSetAnnotations(deployment *apps.Deployment, newRS *apps.ReplicaSet, newRevision string, exists bool, revHistoryLimitInChars int) bool {
-	// First, copy deployment's annotations (except for apply and revision annotations)
-	annotationChanged := copyDeploymentAnnotationsToReplicaSet(deployment, newRS)
-	// Then, update replica set's revision annotation
-	if newRS.Annotations == nil {
-		newRS.Annotations = make(map[string]string)
-	}
-	oldRevision, ok := newRS.Annotations[RevisionAnnotation]
-	// The newRS's revision should be the greatest among all RSes. Usually, its revision number is newRevision (the max revision number
-	// of all old RSes + 1). However, it's possible that some of the old RSes are deleted after the newRS revision being updated, and
-	// newRevision becomes smaller than newRS's revision. We should only update newRS revision when it's smaller than newRevision.
-
-	oldRevisionInt, err := strconv.ParseInt(oldRevision, 10, 64)
-	if err != nil {
-		if oldRevision != "" {
-			klog.Warningf("Updating replica set revision OldRevision not int %s", err)
-			return false
-		}
-		// If the RS annotation is empty then initialize it to 0
-		oldRevisionInt = 0
-	}
-	newRevisionInt, err := strconv.ParseInt(newRevision, 10, 64)
-	if err != nil {
-		klog.Warningf("Updating replica set revision NewRevision not int %s", err)
-		return false
-	}
-	if oldRevisionInt < newRevisionInt {
-		newRS.Annotations[RevisionAnnotation] = newRevision
-		annotationChanged = true
-		klog.V(4).Infof("Updating replica set %q revision to %s", newRS.Name, newRevision)
-	}
-	// If a revision annotation already existed and this replica set was updated with a new revision
-	// then that means we are rolling back to this replica set. We need to preserve the old revisions
-	// for historical information.
-	if ok && oldRevisionInt < newRevisionInt {
-		revisionHistoryAnnotation := newRS.Annotations[RevisionHistoryAnnotation]
-		oldRevisions := strings.Split(revisionHistoryAnnotation, ",")
-		if len(oldRevisions[0]) == 0 {
-			newRS.Annotations[RevisionHistoryAnnotation] = oldRevision
-		} else {
-			totalLen := len(revisionHistoryAnnotation) + len(oldRevision) + 1
-			// index for the starting position in oldRevisions
-			start := 0
-			for totalLen > revHistoryLimitInChars && start < len(oldRevisions) {
-				totalLen = totalLen - len(oldRevisions[start]) - 1
-				start++
-			}
-			if totalLen <= revHistoryLimitInChars {
-				oldRevisions = append(oldRevisions[start:], oldRevision)
-				newRS.Annotations[RevisionHistoryAnnotation] = strings.Join(oldRevisions, ",")
-			} else {
-				klog.Warningf("Not appending revision due to length limit of %v reached", revHistoryLimitInChars)
-			}
-		}
-	}
-	// If the new replica set is about to be created, we need to add replica annotations to it.
-	if !exists && SetReplicasAnnotations(newRS, *(deployment.Spec.Replicas), *(deployment.Spec.Replicas)+MaxSurge(deployment)) {
-		annotationChanged = true
-	}
-	return annotationChanged
-}
-
-func MaxSurge(deployment *apps.Deployment) int32 {
-	if deployment.Spec.Strategy.RollingUpdate == nil {
-		return int32(0)
-	}
-	// Error caught by validation
-	maxSurge, _, _ := ResolveFenceposts(deployment.Spec.Strategy.RollingUpdate.MaxSurge, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable, *(deployment.Spec.Replicas))
-	return maxSurge
-}
-
 func ResolveFenceposts(maxSurge, maxUnavailable *intstrutil.IntOrString, desired int32) (int32, int32, error) {
 	surge, err := intstrutil.GetScaledValueFromIntOrPercent(intstrutil.ValueOrDefault(maxSurge, intstrutil.FromInt(0)), int(desired), true)
 	if err != nil {
@@ -229,7 +157,7 @@ func SetReplicasAnnotations(rs *apps.ReplicaSet, desiredReplicas, maxReplicas in
 	}
 	return updated
 }
-func copyDeploymentAnnotationsToReplicaSet(deployment *apps.Deployment, rs *apps.ReplicaSet) bool {
+func CopyDeploymentAnnotationsToReplicaSet(deployment *apps.Deployment, rs *apps.ReplicaSet) bool {
 	rsAnnotationsChanged := false
 	if rs.Annotations == nil {
 		rs.Annotations = make(map[string]string)
@@ -354,35 +282,6 @@ func SafeEncodeString(s string) string {
 	return string(r)
 }
 
-func NewRSNewReplicas(deployment *apps.Deployment, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, currentStep v1alpha1.Step) (int32, error) {
-	// Find the total number of pods
-	currentPodCount := GetReplicaCountForReplicaSets(allRSs)
-	switch {
-	case currentPodCount > *newRS.Spec.Replicas:
-		// Do not scale down due to partition settings.
-		scaleUpLimit := NewRSReplicasLimit(currentStep.Replicas, deployment)
-		if *newRS.Spec.Replicas >= scaleUpLimit {
-			// Cannot scale up.
-			return *(newRS.Spec.Replicas), nil
-		}
-		// Do not scale up due to exceeded current replicas.
-		maxTotalPods := *(deployment.Spec.Replicas) + MaxSurge(deployment)
-		if currentPodCount >= maxTotalPods {
-			// Cannot scale up.
-			return *(newRS.Spec.Replicas), nil
-		}
-		// Scale up.
-		scaleUpCount := maxTotalPods - currentPodCount
-		// Do not exceed the number of desired replicas.
-		scaleUpCount = int32(integer.IntMin(int(scaleUpCount), int(*(deployment.Spec.Replicas)-*(newRS.Spec.Replicas))))
-		// Do not exceed the number of partition replicas.
-		return integer.Int32Min(*(newRS.Spec.Replicas)+scaleUpCount, scaleUpLimit), nil
-	default:
-		// If there is ONLY ONE active replica set, just be in line with deployment replicas.
-		return *(deployment.Spec.Replicas), nil
-	}
-}
-
 func GetReplicaCountForReplicaSets(replicaSets []*apps.ReplicaSet) int32 {
 	totalReplicas := int32(0)
 	for _, rs := range replicaSets {
@@ -403,13 +302,6 @@ func NewRSReplicasLimit(partition intstrutil.IntOrString, deployment *apps.Deplo
 	return int32(replicaLimit)
 }
 
-func NewRSReplicasLowerBound(deployment *apps.Deployment) int32 {
-	if MaxSurge(deployment) > 0 {
-		return int32(0)
-	}
-	return integer.Int32Min(int32(1), *deployment.Spec.Replicas)
-}
-
 func ReplicasAnnotationsNeedUpdate(rs *apps.ReplicaSet, desiredReplicas, maxReplicas int32) bool {
 	if rs.Annotations == nil {
 		return true
@@ -423,18 +315,6 @@ func ReplicasAnnotationsNeedUpdate(rs *apps.ReplicaSet, desiredReplicas, maxRepl
 		return true
 	}
 	return false
-}
-
-func MaxUnavailable(deployment *apps.Deployment) int32 {
-	if deployment.Spec.Strategy.RollingUpdate == nil || *(deployment.Spec.Replicas) == 0 {
-		return int32(0)
-	}
-	// Error caught by validation
-	_, maxUnavailable, _ := ResolveFenceposts(deployment.Spec.Strategy.RollingUpdate.MaxSurge, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable, *(deployment.Spec.Replicas))
-	if maxUnavailable > *deployment.Spec.Replicas {
-		return *deployment.Spec.Replicas
-	}
-	return maxUnavailable
 }
 
 func GetAvailableReplicaCountForReplicaSets(replicaSets []*apps.ReplicaSet) int32 {
