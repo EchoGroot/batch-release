@@ -31,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -60,11 +59,12 @@ type BatchReleaseReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	klog.V(2).Infof("[Reconcile] Start reconciling BatchRelease %s", req.NamespacedName)
+	log := ctrl.LoggerFrom(ctx)
+	log.V(2).Info("Start reconciling BatchRelease")
 	var br = &v1alpha1.BatchRelease{}
 	if err := r.Get(ctx, req.NamespacedName, br); err != nil {
 		if errors.IsNotFound(err) {
-			klog.V(2).Infof("[Reconcile] BatchRelease %s not found, skip", req.NamespacedName)
+			log.V(2).Info("BatchRelease not found, skip")
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -73,13 +73,15 @@ func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	var de = &apps.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: br.Spec.WorkloadRef.Name}, de); err != nil {
 		if errors.IsNotFound(err) {
-			klog.V(1).Infof("Deployment %v not found, namespace:%s", br.Spec.WorkloadRef.Name, req.Namespace)
+			log.V(1).Info("Deployment not found",
+				"deployment", br.Spec.WorkloadRef.Name,
+				"namespace", req.Namespace)
 		}
 		return ctrl.Result{}, err
 	}
 
 	var errList field.ErrorList
-	executor := partition.NewExecutor(br.DeepCopy(), de.DeepCopy(), r.Client, r.eventRecorder)
+	executor := partition.NewExecutor(br.DeepCopy(), de.DeepCopy(), r.Client, r.eventRecorder, log)
 
 	result, err := executor.SyncDeployment(ctx)
 	if err != nil {
@@ -87,7 +89,12 @@ func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if !reflect.DeepEqual(br.Status, executor.Br.Status) {
-		klog.V(1).Infof("BatchRelease %v status changed, old:%v, new:%v", br.Name, br.Status, executor.Br.Status)
+		log.V(1).Info("BatchRelease status changed",
+			"name", br.Name,
+			"oldPhase", br.Status.Phase,
+			"newPhase", executor.Br.Status.Phase,
+			"oldStep", br.Status.CurrentStepIndex,
+			"newStep", executor.Br.Status.CurrentStepIndex)
 		if err := partition.UpdateObjStatus(ctx, r.Client, br.DeepCopy(), func(object client.Object) {
 			newBr := object.(*v1alpha1.BatchRelease)
 			newBr.Status = executor.Br.Status
@@ -98,7 +105,8 @@ func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 	if len(errList) > 0 {
-		klog.Errorf("BatchRelease %v reconcile error: %v", br.Name, errList)
+		log.Error(errList.ToAggregate(), "BatchRelease reconcile error",
+			"name", br.Name)
 		return result, errList.ToAggregate()
 	}
 
@@ -108,7 +116,10 @@ func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	err = deploymentutil.DeploymentRolloutSatisfied(de, executor.Br.Spec.Strategy.Steps[executor.Br.Status.CurrentStepIndex].Replicas)
 	if err != nil {
-		klog.V(4).Infof("Deployment %v is still rolling: %v", klog.KObj(de), err)
+		log.V(4).Info("Deployment is still rolling",
+			"deployment", de.Name,
+			"namespace", de.Namespace,
+			"reason", err.Error())
 		return reconcile.Result{RequeueAfter: DefaultRetryDuration}, nil
 	}
 	return reconcile.Result{}, nil
@@ -122,5 +133,6 @@ func (r *BatchReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&v1alpha1.BatchRelease{}).
 		Named("batchrelease").
 		Watches(&apps.ReplicaSet{}, &enqueueRequestForReplicaset{}).
+		Watches(&apps.Deployment{}, &enqueueRequestForDeployment{}).
 		Complete(r)
 }

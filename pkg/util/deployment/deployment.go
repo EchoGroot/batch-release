@@ -489,3 +489,75 @@ func DeploymentRolloutSatisfied(deployment *apps.Deployment, partition intstruti
 	}
 	return nil
 }
+
+func GetReplicasAnnotation(rs *apps.ReplicaSet) (int32, bool) {
+	return getIntFromAnnotation(rs, ReplicasAnnotation)
+}
+
+func getIntFromAnnotation(rs *apps.ReplicaSet, annotationKey string) (int32, bool) {
+	annotationValue, ok := rs.Annotations[annotationKey]
+	if !ok {
+		return int32(0), false
+	}
+	intValue, err := strconv.Atoi(annotationValue)
+	if err != nil {
+		klog.V(2).Infof("Cannot convert the value %q with annotation key %q for the replica set %q", annotationValue, annotationKey, rs.Name)
+		return int32(0), false
+	}
+	return int32(intValue), true
+}
+
+func FindActiveOrLatest(newRS *apps.ReplicaSet, oldRSs []*apps.ReplicaSet) *apps.ReplicaSet {
+	if newRS == nil && len(oldRSs) == 0 {
+		return nil
+	}
+
+	sort.Sort(sort.Reverse(ReplicaSetsByCreationTimestamp(oldRSs)))
+	allRSs := FilterActiveReplicaSets(append(oldRSs, newRS))
+
+	switch len(allRSs) {
+	case 0:
+		// If there is no active replica set then we should return the newest.
+		if newRS != nil {
+			return newRS
+		}
+		return oldRSs[0]
+	case 1:
+		return allRSs[0]
+	default:
+		return nil
+	}
+}
+
+func IsSaturated(deployment *apps.Deployment, rs *apps.ReplicaSet) bool {
+	if rs == nil {
+		return false
+	}
+	desiredString := rs.Annotations[ReplicasAnnotation]
+	desired, err := strconv.Atoi(desiredString)
+	if err != nil {
+		return false
+	}
+	return *(rs.Spec.Replicas) == *(deployment.Spec.Replicas) &&
+		int32(desired) == *(deployment.Spec.Replicas) &&
+		rs.Status.AvailableReplicas == *(deployment.Spec.Replicas)
+}
+
+func IsRollingUpdate(_ *apps.Deployment) bool {
+	return true
+}
+
+type ReplicaSetsBySizeNewer []*apps.ReplicaSet
+
+func (o ReplicaSetsBySizeNewer) Len() int      { return len(o) }
+func (o ReplicaSetsBySizeNewer) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+func (o ReplicaSetsBySizeNewer) Less(i, j int) bool {
+	if *(o[i].Spec.Replicas) == *(o[j].Spec.Replicas) {
+		return ReplicaSetsByCreationTimestamp(o).Less(j, i)
+	}
+	return *(o[i].Spec.Replicas) > *(o[j].Spec.Replicas)
+}
+
+func GetMaxReplicasAnnotation(rs *apps.ReplicaSet) (int32, bool) {
+	return getIntFromAnnotation(rs, MaxReplicasAnnotation)
+}
