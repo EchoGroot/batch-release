@@ -58,6 +58,7 @@ type Phase string
 const (
 	PhaseInitial       Phase = "Initial"
 	PhaseRollingUpdate Phase = "RollingUpdate"
+	PhaseRollingBack   Phase = "RollingBack"
 	PhaseFinalizing    Phase = "Finalizing"
 	PhaseCompleted     Phase = "Completed"
 )
@@ -72,7 +73,13 @@ const (
 )
 
 const (
-	StepBlockingMessage = "Step is in blocking state and needs to be continued manually"
+	StepBlockingMessage          = "Step is in blocking state and needs to be continued manually"
+	CurrentStableReversionKey    = "current-stable-reversion"
+	CurrentStableReversionRawKey = "current-stable-reversion-raw"
+	LastStableReversionKey       = "last-stable-reversion"
+	LastStableReversionRawKey    = "last-stable-reversion-raw"
+
+	RollbackMark = "rollback"
 )
 
 // BatchReleaseStatus defines the observed state of BatchRelease.
@@ -83,16 +90,17 @@ type BatchReleaseStatus struct {
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
-	Phase                Phase               `json:"phase,omitempty"`
-	CurrentStepIndex     int32               `json:"currentStepIndex,omitempty"`
-	CurrentStepState     StepState           `json:"currentStepState,omitempty"`
-	UpdatedReadyReplicas int32               `json:"updatedReadyReplicas,omitempty"`
-	MaxUnavailable       *intstr.IntOrString `json:"maxUnavailable,omitempty" protobuf:"bytes,1,opt,name=maxUnavailable"`
-	MaxSurge             *intstr.IntOrString `json:"maxSurge,omitempty" protobuf:"bytes,2,opt,name=maxSurge"`
-	Reason               BatchReleaseReason  `json:"reason,omitempty"`
-	Message              string              `json:"message,omitempty"`
-	ObservedGeneration   int64               `json:"observedGeneration,omitempty"`
-	LastUpdateTime       *metav1.Time        `json:"lastUpdateTime,omitempty"`
+	Phase                   Phase               `json:"phase"`
+	CurrentStepIndex        int32               `json:"currentStepIndex"`
+	CurrentStepState        StepState           `json:"currentStepState"`
+	UpdatedReadyReplicas    int32               `json:"updatedReadyReplicas"`
+	MaxUnavailable          *intstr.IntOrString `json:"maxUnavailable" protobuf:"bytes,1,opt,name=maxUnavailable"`
+	MaxSurge                *intstr.IntOrString `json:"maxSurge" protobuf:"bytes,2,opt,name=maxSurge"`
+	Reason                  BatchReleaseReason  `json:"reason"`
+	Message                 string              `json:"message"`
+	ObservedGeneration      int64               `json:"observedGeneration"`
+	ObservedUpdateReversion string              `json:"observedUpdateReversion"`
+	LastUpdateTime          *metav1.Time        `json:"lastUpdateTime"`
 }
 
 type BatchReleaseReason string
@@ -103,6 +111,11 @@ const (
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="The current phase of the release"
+// +kubebuilder:printcolumn:name="Index",type="integer",JSONPath=".status.currentStepIndex",description="The current step index"
+// +kubebuilder:printcolumn:name="State",type="string",JSONPath=".status.currentStepState",description="The current state of the step"
+// +kubebuilder:printcolumn:name="Reason",type="string",JSONPath=".status.reason",description="The reason for the current status"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // BatchRelease is the Schema for the batchreleases API
 type BatchRelease struct {

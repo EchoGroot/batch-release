@@ -26,6 +26,7 @@ import (
 	"k8s.io/utils/integer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -55,37 +56,69 @@ func NewExecutor(br *v1alpha1.BatchRelease, de *apps.Deployment, client client.C
 
 func (e *Executor) SyncDeployment(ctx context.Context) (ctrl.Result, error) {
 	e.Br.Status.Reason, e.Br.Status.Message = "", ""
+	podTemplateHash := deploymentutil.ComputeHash(e.Br.Spec.Template.DeepCopy(), nil)
+	if len(e.Br.Status.ObservedUpdateReversion) > 0 && e.Br.Status.ObservedUpdateReversion != podTemplateHash && !e.isPreRollback() {
+		e.eventRecorder.Eventf(e.Br, v1.EventTypeNormal, "BatchReleaseUpdated", "BatchRelease %s updated for Deployment %s", e.Br.Name, e.de.Name)
+		e.Br.Status.ObservedUpdateReversion = podTemplateHash
+		e.Br.Status.Phase = v1alpha1.PhaseInitial
+		return ctrl.Result{}, nil
+	}
+
 	switch e.Br.Status.Phase {
 	default:
 		e.Br.Status.Phase = v1alpha1.PhaseInitial
 		fallthrough
 	case v1alpha1.PhaseInitial:
-		return e.init(ctx)
+		if success, err := e.init(ctx); err != nil || !success {
+			return ctrl.Result{}, err
+		}
+		e.eventRecorder.Eventf(e.Br, v1.EventTypeNormal, "BatchReleaseStarted", "BatchRelease %s started for Deployment %s", e.Br.Name, e.de.Name)
+		e.Br.Status.Phase = v1alpha1.PhaseRollingUpdate
+		return ctrl.Result{}, nil
 	case v1alpha1.PhaseRollingUpdate:
-		rsList, err := e.getReplicaSetsForDeployment(ctx, e.de)
-		if err != nil {
-			return ctrl.Result{}, err
+		if e.isPreRollback() {
+			e.eventRecorder.Eventf(e.Br, v1.EventTypeNormal, "RollbackRequested", "Rollback requested during rolling update for BatchRelease %s", e.Br.Name)
+			return e.preRollback(ctx, e.Br.Annotations[v1alpha1.CurrentStableReversionKey], e.Br.Annotations[v1alpha1.CurrentStableReversionRawKey])
 		}
-
-		scalingEvent, err := e.isScalingEvent(ctx, rsList)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		if scalingEvent {
-			if err := e.sync(ctx, rsList); err != nil {
-				return ctrl.Result{}, err
-			}
-			e.Br.Status.CurrentStepState = v1alpha1.StepStateInitial
-			return ctrl.Result{}, nil
-		}
-
-		return e.stepByStep(ctx, rsList)
+		return e.rollingUpdate(ctx)
+	case v1alpha1.PhaseRollingBack:
+		return e.rollingUpdate(ctx)
 	case v1alpha1.PhaseFinalizing:
 		return e.finalize(ctx)
 	case v1alpha1.PhaseCompleted:
+		if e.isPreRollback() {
+			e.eventRecorder.Eventf(e.Br, v1.EventTypeNormal, "RollbackRequested", "Rollback requested after completion for BatchRelease %s", e.Br.Name)
+			return e.preRollback(ctx, e.Br.Annotations[v1alpha1.LastStableReversionKey], e.Br.Annotations[v1alpha1.LastStableReversionRawKey])
+		}
 		return ctrl.Result{}, nil
 	}
+}
+
+func (e *Executor) isPreRollback() bool {
+	_, ok := e.Br.Annotations[v1alpha1.RollbackMark]
+	return ok
+}
+
+func (e *Executor) rollingUpdate(ctx context.Context) (ctrl.Result, error) {
+	rsList, err := e.getReplicaSetsForDeployment(ctx, e.de)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	scalingEvent, err := e.isScalingEvent(ctx, rsList)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if scalingEvent {
+		if err := e.sync(ctx, rsList); err != nil {
+			return ctrl.Result{}, err
+		}
+		e.Br.Status.CurrentStepState = v1alpha1.StepStateInitial
+		return ctrl.Result{}, nil
+	}
+
+	return e.stepByStep(ctx, rsList)
 }
 
 func (e *Executor) isScalingEvent(ctx context.Context, rsList []*apps.ReplicaSet) (bool, error) {
@@ -108,7 +141,7 @@ func (e *Executor) isScalingEvent(ctx context.Context, rsList []*apps.ReplicaSet
 
 func (e *Executor) finalize(ctx context.Context) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
-	err := UpdateObj(ctx, e.client, e.de, func(object client.Object) {
+	err := UpdateObj(ctx, e.client, e.de.DeepCopy(), func(object client.Object) {
 		newDe := object.(*apps.Deployment)
 		newDe.Spec.Paused = false
 		newDe.Spec.Strategy.Type = apps.RollingUpdateDeploymentStrategyType
@@ -122,21 +155,37 @@ func (e *Executor) finalize(ctx context.Context) (ctrl.Result, error) {
 		return ctrl.Result{RequeueAfter: DefaultDuration}, err
 	}
 
+	if err := e.recordStableVersion(ctx, e.Br.Spec.Template.DeepCopy()); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	e.eventRecorder.Eventf(e.Br, v1.EventTypeNormal, "BatchReleaseCompleted", "BatchRelease %s completed for Deployment %s", e.Br.Name, e.de.Name)
 	e.Br.Status.Phase = v1alpha1.PhaseCompleted
 	return ctrl.Result{}, nil
 }
 
-func (e *Executor) init(ctx context.Context) (ctrl.Result, error) {
+func (e *Executor) init(ctx context.Context) (bool, error) {
+	if e.Br.Status.MaxUnavailable == nil || e.Br.Status.MaxSurge == nil {
+		if e.de.Spec.Strategy.RollingUpdate == nil {
+			return false, fmt.Errorf("deployment %s/%s does not have RollingUpdate strategy", e.de.Namespace, e.de.Name)
+		}
+		e.Br.Status.MaxUnavailable = e.de.Spec.Strategy.RollingUpdate.MaxUnavailable
+		e.Br.Status.MaxSurge = e.de.Spec.Strategy.RollingUpdate.MaxSurge
+		return false, nil
+	}
+
+	if _, ok := e.Br.Annotations[v1alpha1.CurrentStableReversionKey]; !ok {
+		return false, e.recordStableVersion(ctx, e.de.Spec.Template.DeepCopy())
+	}
+
 	e.Br.Status.CurrentStepIndex = 0
 	e.Br.Status.CurrentStepState = ""
 	e.Br.Status.UpdatedReadyReplicas = 0
-	if e.de.Spec.Strategy.RollingUpdate == nil {
-		return ctrl.Result{}, fmt.Errorf("deployment %s/%s does not have RollingUpdate strategy", e.de.Namespace, e.de.Name)
-	}
-	e.Br.Status.MaxUnavailable = e.de.Spec.Strategy.RollingUpdate.MaxUnavailable
-	e.Br.Status.MaxSurge = e.de.Spec.Strategy.RollingUpdate.MaxSurge
 
-	if err := UpdateObj(ctx, e.client, e.de, func(object client.Object) {
+	podTemplateHash := deploymentutil.ComputeHash(e.Br.Spec.Template.DeepCopy(), nil)
+	e.Br.Status.ObservedUpdateReversion = podTemplateHash
+
+	if err := UpdateObj(ctx, e.client, e.de.DeepCopy(), func(object client.Object) {
 		d := object.(*apps.Deployment)
 		d.Spec.Template = e.Br.Spec.Template
 		d.Spec.Paused = true
@@ -147,13 +196,12 @@ func (e *Executor) init(ctx context.Context) (ctrl.Result, error) {
 		}
 		d.Annotations[v1alpha1.BatchReleaseControlInfoAnno] = jsonutil.DumpJSON(metav1.NewControllerRef(e.Br, e.Br.GetObjectKind().GroupVersionKind()))
 	}); err != nil {
-		return ctrl.Result{}, err
+		return false, err
 	}
 	e.log.V(1).Info("Successfully updated Deployment",
 		"deployment", e.de.Name)
 
-	e.Br.Status.Phase = v1alpha1.PhaseRollingUpdate
-	return ctrl.Result{}, nil
+	return true, nil
 }
 
 func (e *Executor) stepByStep(ctx context.Context, rsList []*apps.ReplicaSet) (ctrl.Result, error) {
@@ -212,10 +260,12 @@ func (e *Executor) stepByStep(ctx context.Context, rsList []*apps.ReplicaSet) (c
 			return ctrl.Result{}, nil
 		}
 		e.Br.Status.Reason, e.Br.Status.Message = v1alpha1.BatchReleaseReasonStepBlocking, v1alpha1.StepBlockingMessage
+		e.eventRecorder.Eventf(e.Br, v1.EventTypeNormal, "BatchStepBlocking", "Batch step %d is blocking for BatchRelease %s", e.Br.Status.CurrentStepIndex, e.Br.Name)
 		return ctrl.Result{}, nil
 	case v1alpha1.StepStateCompleted:
 		e.log.V(1).Info("Release step completed",
 			"step", e.Br.Status.CurrentStepIndex)
+		e.eventRecorder.Eventf(e.Br, v1.EventTypeNormal, "BatchStepCompleted", "Batch step %d completed for BatchRelease %s", e.Br.Status.CurrentStepIndex, e.Br.Name)
 		if e.Br.Status.CurrentStepIndex == int32(len(e.Br.Spec.Strategy.Steps))-1 {
 			e.Br.Status.Phase = v1alpha1.PhaseFinalizing
 			return ctrl.Result{}, nil
@@ -1330,4 +1380,83 @@ func (e *Executor) newRSReplicasLowerBound(deployment *apps.Deployment) int32 {
 		return int32(0)
 	}
 	return integer.Int32Min(int32(1), *deployment.Spec.Replicas)
+}
+
+func (e *Executor) recordStableVersion(ctx context.Context, podTemplate *v1.PodTemplateSpec) error {
+	csv, csvr := e.Br.Annotations[v1alpha1.CurrentStableReversionKey], e.Br.Annotations[v1alpha1.CurrentStableReversionRawKey]
+
+	podTemplateHash := deploymentutil.ComputeHash(podTemplate, nil)
+	if csv == podTemplateHash {
+		return nil
+	}
+
+	templateYaml, err := yaml.Marshal(podTemplate)
+	if err != nil {
+		e.log.Error(err, "Failed to serialize template to yaml")
+		return nil
+	}
+	err = UpdateObj(ctx, e.client, e.Br.DeepCopy(), func(object client.Object) {
+		br := object.(*v1alpha1.BatchRelease)
+		if br.Annotations == nil {
+			br.Annotations = make(map[string]string)
+		}
+		br.Annotations[v1alpha1.CurrentStableReversionKey] = podTemplateHash
+		br.Annotations[v1alpha1.CurrentStableReversionRawKey] = string(templateYaml)
+
+		if len(csv) == 0 {
+			// 初次部署
+			br.Annotations[v1alpha1.LastStableReversionKey] = podTemplateHash
+			br.Annotations[v1alpha1.LastStableReversionRawKey] = string(templateYaml)
+		} else {
+			br.Annotations[v1alpha1.LastStableReversionKey] = csv
+			br.Annotations[v1alpha1.LastStableReversionRawKey] = csvr
+		}
+	})
+	if err != nil {
+		return err
+	}
+
+	e.log.V(4).Info("Record current stable reversion", "currentStableReversion", podTemplateHash)
+	if len(csv) != 0 {
+		e.log.V(4).Info("Record last stable reversion", "lastStableReversion", csv)
+	}
+	return nil
+}
+
+func (e *Executor) preRollback(ctx context.Context, reversion, podTemplate string) (ctrl.Result, error) {
+	e.log.V(2).Info("Rolling back")
+	e.eventRecorder.Eventf(e.Br, v1.EventTypeNormal, "RollbackStarted", "Rollback started for BatchRelease %s", e.Br.Name)
+
+	if reversion != deploymentutil.ComputeHash(e.Br.Spec.Template.DeepCopy(), nil) {
+		var podTemplateObj = v1.PodTemplateSpec{}
+		if err := yaml.Unmarshal([]byte(podTemplate), &podTemplateObj); err != nil {
+			return ctrl.Result{}, err
+		}
+		err := UpdateObj(ctx, e.client, e.Br.DeepCopy(), func(object client.Object) {
+			br := object.(*v1alpha1.BatchRelease)
+			br.Spec.Strategy.Steps = []v1alpha1.Step{
+				{Replicas: intstr.Parse("1")},
+				{Replicas: intstr.Parse("100%")},
+			}
+			br.Spec.Template = podTemplateObj
+		})
+		return ctrl.Result{}, err
+	}
+
+	if success, err := e.init(ctx); err != nil || !success {
+		return ctrl.Result{}, err
+	}
+
+	// 必须先更新phase，再删除RollbackMark
+	// 如果先更新RollbackMark，再更新phase，更新phase失败，下次调谐会运行到PhaseRollingUpdate阶段的非回滚逻辑
+	e.Br.Status.Phase = v1alpha1.PhaseRollingBack
+	if err := e.client.Status().Update(ctx, e.Br); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	err := UpdateObj(ctx, e.client, e.Br, func(object client.Object) {
+		br := object.(*v1alpha1.BatchRelease)
+		delete(br.Annotations, v1alpha1.RollbackMark)
+	})
+	return ctrl.Result{}, err
 }

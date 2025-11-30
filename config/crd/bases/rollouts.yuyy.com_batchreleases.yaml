@@ -14,7 +14,27 @@ spec:
     singular: batchrelease
   scope: Namespaced
   versions:
-  - name: v1alpha1
+    - additionalPrinterColumns:
+        - description: The current phase of the release
+          jsonPath: .status.phase
+          name: Phase
+          type: string
+        - description: The current step index
+          jsonPath: .status.currentStepIndex
+          name: Index
+          type: integer
+        - description: The current state of the step
+          jsonPath: .status.currentStepState
+          name: State
+          type: string
+        - description: The reason for the current status
+          jsonPath: .status.reason
+          name: Reason
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
     schema:
       openAPIV3Schema:
         description: BatchRelease is the Schema for the batchreleases API
@@ -102,6 +122,8 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              observedUpdateReversion:
+                type: string
               phase:
                 type: string
               reason:
