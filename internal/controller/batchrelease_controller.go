@@ -21,9 +21,10 @@ import (
 	"reflect"
 	"time"
 
-	v1alpha1 "github.com/EchoGroot/batch-release/api/v1alpha1"
+	"github.com/EchoGroot/batch-release/api/v1alpha1"
 	"github.com/EchoGroot/batch-release/internal/controller/partition"
 	deploymentutil "github.com/EchoGroot/batch-release/pkg/util/deployment"
+	"github.com/go-logr/logr"
 	apps "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,10 +34,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
-
-const DefaultRetryDuration = 2 * time.Second
 
 // BatchReleaseReconciler reconciles a BatchRelease object
 type BatchReleaseReconciler struct {
@@ -61,10 +59,11 @@ type BatchReleaseReconciler struct {
 func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 	log.V(2).Info("Start reconciling BatchRelease")
+
 	var br = &v1alpha1.BatchRelease{}
 	if err := r.Get(ctx, req.NamespacedName, br); err != nil {
 		if errors.IsNotFound(err) {
-			log.V(2).Info("BatchRelease not found, skip")
+			log.V(2).Info("BatchRelease not found, skip", "batchrelease", req.Name, "namespace", req.Namespace)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -73,37 +72,23 @@ func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	var de = &apps.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: br.Spec.WorkloadRef.Name}, de); err != nil {
 		if errors.IsNotFound(err) {
-			log.V(1).Info("Deployment not found",
-				"deployment", br.Spec.WorkloadRef.Name,
-				"namespace", req.Namespace)
+			log.V(1).Info("Deployment not found", "deployment", br.Spec.WorkloadRef.Name, "namespace", req.Namespace)
 		}
 		return ctrl.Result{}, err
 	}
 
 	var errList field.ErrorList
-	executor := partition.NewExecutor(br.DeepCopy(), de.DeepCopy(), r.Client, r.eventRecorder, log)
 
-	result, err := executor.SyncDeployment(ctx)
+	executor := partition.NewExecutor(br.DeepCopy(), de.DeepCopy(), r.Client, r.eventRecorder, log)
+	result, err := executor.Do(ctx)
 	if err != nil {
 		errList = append(errList, field.InternalError(field.NewPath("executorSyncDeployment"), err))
 	}
 
-	if !reflect.DeepEqual(br.Status, executor.Br.Status) {
-		log.V(1).Info("BatchRelease status changed",
-			"name", br.Name,
-			"oldPhase", br.Status.Phase,
-			"newPhase", executor.Br.Status.Phase,
-			"oldStep", br.Status.CurrentStepIndex,
-			"newStep", executor.Br.Status.CurrentStepIndex)
-		if err := partition.UpdateObjStatus(ctx, r.Client, br.DeepCopy(), func(object client.Object) {
-			newBr := object.(*v1alpha1.BatchRelease)
-			newBr.Status = executor.Br.Status
-			newBr.Status.ObservedGeneration = br.Generation
-			newBr.Status.LastUpdateTime = &metav1.Time{Time: time.Now()}
-		}); err != nil {
-			errList = append(errList, field.InternalError(field.NewPath("updateStatus"), err))
-		}
+	if err := r.syncBatchReleaseStatus(ctx, br, executor.Br, log); err != nil {
+		errList = append(errList, field.InternalError(field.NewPath("updateStatus"), err))
 	}
+
 	if len(errList) > 0 {
 		log.Error(errList.ToAggregate(), "BatchRelease reconcile error",
 			"name", br.Name)
@@ -114,15 +99,35 @@ func (r *BatchReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return result, nil
 	}
 
-	err = deploymentutil.DeploymentRolloutSatisfied(de, executor.Br.Spec.Strategy.Steps[executor.Br.Status.CurrentStepIndex].Replicas)
-	if err != nil {
+	if err := deploymentutil.DeploymentRolloutSatisfied(de, executor.DesiredPartition()); err != nil {
 		log.V(4).Info("Deployment is still rolling",
 			"deployment", de.Name,
 			"namespace", de.Namespace,
 			"reason", err.Error())
-		return reconcile.Result{RequeueAfter: DefaultRetryDuration}, nil
+		return ctrl.Result{RequeueAfter: partition.DefaultRetryDuration}, nil
 	}
-	return reconcile.Result{}, nil
+
+	return ctrl.Result{}, nil
+}
+
+func (r *BatchReleaseReconciler) syncBatchReleaseStatus(ctx context.Context, old, new *v1alpha1.BatchRelease, log logr.Logger) error {
+	if reflect.DeepEqual(old.Status, new.Status) {
+		return nil
+	}
+
+	log.V(1).Info("BatchRelease status changed",
+		"name", old.Name,
+		"oldPhase", old.Status.Phase,
+		"newPhase", new.Status.Phase,
+		"oldStep", old.Status.CurrentStepIndex,
+		"newStep", new.Status.CurrentStepIndex)
+
+	return partition.UpdateObjStatus(ctx, r.Client, old.DeepCopy(), func(object client.Object) {
+		br := object.(*v1alpha1.BatchRelease)
+		br.Status = new.Status
+		br.Status.ObservedGeneration = old.Generation
+		br.Status.LastUpdateTime = &metav1.Time{Time: time.Now()}
+	})
 }
 
 // SetupWithManager sets up the controller with the Manager.
