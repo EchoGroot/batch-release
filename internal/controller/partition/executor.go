@@ -82,6 +82,9 @@ func (e *Executor) SyncDeployment(ctx context.Context) (ctrl.Result, error) {
 		}
 		return e.rollingUpdate(ctx)
 	case v1alpha1.PhaseRollingBack:
+		if e.isPreRollback() {
+			return e.removeRollbackMark(ctx)
+		}
 		return e.rollingUpdate(ctx)
 	case v1alpha1.PhaseFinalizing:
 		return e.finalize(ctx)
@@ -92,6 +95,15 @@ func (e *Executor) SyncDeployment(ctx context.Context) (ctrl.Result, error) {
 		}
 		return ctrl.Result{}, nil
 	}
+}
+
+func (e *Executor) removeRollbackMark(ctx context.Context) (ctrl.Result, error) {
+	e.log.V(1).Info("Removing leftover RollbackMark in RollingBack phase")
+	err := UpdateObj(ctx, e.client, e.Br, func(object client.Object) {
+		br := object.(*v1alpha1.BatchRelease)
+		delete(br.Annotations, v1alpha1.RollbackMark)
+	})
+	return ctrl.Result{}, err
 }
 
 func (e *Executor) isPreRollback() bool {
@@ -1447,16 +1459,6 @@ func (e *Executor) preRollback(ctx context.Context, reversion, podTemplate strin
 		return ctrl.Result{}, err
 	}
 
-	// 必须先更新phase，再删除RollbackMark
-	// 如果先更新RollbackMark，再更新phase，更新phase失败，下次调谐会运行到PhaseRollingUpdate阶段的非回滚逻辑
 	e.Br.Status.Phase = v1alpha1.PhaseRollingBack
-	if err := e.client.Status().Update(ctx, e.Br); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	err := UpdateObj(ctx, e.client, e.Br, func(object client.Object) {
-		br := object.(*v1alpha1.BatchRelease)
-		delete(br.Annotations, v1alpha1.RollbackMark)
-	})
-	return ctrl.Result{}, err
+	return ctrl.Result{}, nil
 }
